@@ -24,7 +24,7 @@ def get_db():
         host="localhost",
         user="root",
         password="9799",
-        database="youtube_homeview",
+        database="youtube_app",
     )
 
     try:
@@ -74,5 +74,9 @@ def get_db():
 
         def __getattr__(self, item):
             return getattr(self._conn, item)
+        
+        def get_raw_connection(self):
+            """Return the raw connection for pandas or other libraries."""
+            return self._conn
 
     return _ConnWrapper(conn, driver)

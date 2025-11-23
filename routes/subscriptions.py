@@ -10,8 +10,8 @@ bp = Blueprint("subscriptions", __name__)
 # --------------------------
 @bp.get("/<int:user_id>/header")
 def get_header(user_id):
-    db = get_db()
-    cur = db.cursor(dictionary=True)
+    conn = get_db()
+    cur = conn.cursor(dictionary=True)
 
     query = """
     SELECT 
@@ -38,7 +38,7 @@ def get_header(user_id):
     rows = cur.fetchall()
 
     cur.close()
-    db.close()
+    conn.close()
     return jsonify({"headers": rows})
 
 
@@ -68,8 +68,8 @@ def get_feed(user_id):
     filter_type = request.args.get("type")    # ex) video / shorts / live
     filter_opt  = request.args.get("filter")  # ex) today / continue / unwatched / all
 
-    db = get_db()
-    cur = db.cursor(dictionary=True)
+    conn = get_db()
+    cur = conn.cursor(dictionary=True)
 
     query = """
     SELECT 
@@ -132,7 +132,7 @@ def get_feed(user_id):
     rows = cur.fetchall()
 
     cur.close()
-    db.close()
+    conn.close()
 
     # minutes_diff -> time_ago
     for row in rows:
@@ -180,8 +180,8 @@ def get_feed(user_id):
 # --------------------------
 @bp.post("/<int:user_id>/channel/<int:channel_id>")
 def subscribe_channel(user_id, channel_id):
-    db = get_db()
-    cur = db.cursor()
+    conn = get_db()
+    cur = conn.cursor(dictionary=True)
 
     try:
         cur.execute(
@@ -192,14 +192,37 @@ def subscribe_channel(user_id, channel_id):
             """,
             (user_id, channel_id)
         )
-        db.commit()
-        return jsonify({"success": True, "action": "subscribed"}), 201
+        conn.commit()
+        
+        # 구독 정보 조회
+        cur.execute("""
+            SELECT 
+                s.subscriber_id,
+                u1.username AS subscriber_name,
+                u1.handle AS subscriber_handle,
+                s.channel_id,
+                u2.username AS channel_name,
+                u2.handle AS channel_handle,
+                s.subscribed_at
+            FROM Subscriptions s
+            JOIN Users u1 ON s.subscriber_id = u1.user_id
+            JOIN Users u2 ON s.channel_id = u2.user_id
+            WHERE s.subscriber_id = %s AND s.channel_id = %s
+        """, (user_id, channel_id))
+        
+        subscription = cur.fetchone()
+        
+        return jsonify({
+            "success": True, 
+            "action": "subscribed",
+            "subscription": subscription
+        }), 201
     except Exception as e:
-        db.rollback()
+        conn.rollback()
         return jsonify({"success": False, "error": str(e)}), 400
     finally:
         cur.close()
-        db.close()
+        conn.close()
 
 
 # --------------------------
@@ -208,18 +231,47 @@ def subscribe_channel(user_id, channel_id):
 # --------------------------
 @bp.delete("/<int:user_id>/channel/<int:channel_id>")
 def unsubscribe_channel(user_id, channel_id):
-    db = get_db()
-    cur = db.cursor()
+    conn = get_db()
+    cur = conn.cursor(dictionary=True)
+
+    # 삭제 전 정보 조회
+    cur.execute("""
+        SELECT 
+            u1.username AS subscriber_name,
+            u1.handle AS subscriber_handle,
+            u2.username AS channel_name,
+            u2.handle AS channel_handle
+        FROM Subscriptions s
+        JOIN Users u1 ON s.subscriber_id = u1.user_id
+        JOIN Users u2 ON s.channel_id = u2.user_id
+        WHERE s.subscriber_id = %s AND s.channel_id = %s
+    """, (user_id, channel_id))
+    
+    subscription_info = cur.fetchone()
 
     cur.execute(
         "DELETE FROM Subscriptions WHERE subscriber_id = %s AND channel_id = %s",
         (user_id, channel_id)
     )
-    db.commit()
+    affected_rows = cur.rowcount
+    conn.commit()
 
     cur.close()
-    db.close()
-    return jsonify({"success": True, "action": "unsubscribed"})
+    conn.close()
+    
+    if affected_rows > 0 and subscription_info:
+        return jsonify({
+            "success": True, 
+            "action": "unsubscribed",
+            "subscriber_id": user_id,
+            "subscriber_name": subscription_info["subscriber_name"],
+            "subscriber_handle": subscription_info["subscriber_handle"],
+            "channel_id": channel_id,
+            "channel_name": subscription_info["channel_name"],
+            "channel_handle": subscription_info["channel_handle"]
+        })
+    else:
+        return jsonify({"success": False, "error": "Subscription not found"}), 404
 
 
 # --------------------------
@@ -244,8 +296,8 @@ def get_subscriptions(user_id):
     if offset < 0:
         offset = 0
 
-    db = get_db()
-    cur = db.cursor(dictionary=True)
+    conn = get_db()
+    cur = conn.cursor(dictionary=True)
 
     # total count
     count_q = "SELECT COUNT(*) AS total FROM Subscriptions WHERE subscriber_id = %s"
@@ -270,7 +322,7 @@ def get_subscriptions(user_id):
     rows = cur.fetchall()
 
     cur.close()
-    db.close()
+    conn.close()
 
     return jsonify({
         "subscriptions": rows,
