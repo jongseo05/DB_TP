@@ -4,429 +4,409 @@ from db import get_db
 shorts_bp = Blueprint("shorts", __name__)
 
 
-# ==================================================
-# 1) 쇼츠 상세 조회 + 댓글수 포함
-# ==================================================
-@shorts_bp.route("/shorts/<int:shorts_id>", methods=["GET"])
-def shorts_detail(shorts_id):
+# ----------------------------
+# 1) Shorts 리스트 (GET)
+#    GET /shorts/list?user_id=3&offset=0&limit=20
+# ----------------------------
+@shorts_bp.route("/shorts/list", methods=["GET"])
+def shorts_list():
+    try:
+        user_id = request.args.get("user_id", type=int)  # optional but recommended
+        offset = request.args.get("offset", default=0, type=int)
+        limit = request.args.get("limit", default=20, type=int)
 
-    conn = get_db()
-    cur = conn.cursor(dictionary=True)
-    
-    sql = """
+        conn = get_db()
+        cur = conn.cursor(dictionary=True)
+
+        sql = """
         SELECT 
-            s.shorts_id,
-            s.title,
-            s.video_url,
-            s.thumbnail_url,
-            s.duration_seconds,
-            s.views,
-            s.created_at,
-            u.username,
-            u.handle,
-            u.profile_img,
-            (SELECT COUNT(*) FROM Shorts_Comment WHERE shorts_id = s.shorts_id) AS comment_count,
-            (SELECT COUNT(*) FROM Shorts_Like WHERE shorts_id = s.shorts_id AND type='like') AS like_count,
-            (SELECT COUNT(*) FROM Shorts_Like WHERE shorts_id = s.shorts_id AND type='dislike') AS dislike_count
-        FROM Shorts s
-        JOIN Users u ON s.user_id = u.user_id
-        WHERE s.shorts_id = %s;
-    """
+            v.video_id AS shorts_id,
+            v.user_id AS channel_id,
+            u.username AS channel_name,
+            v.title,
+            v.video_url,
+            v.thumbnail_url,
+            v.duration,
+            v.view_count,
+            v.like_count,
+            v.comment_count,
+            v.upload_date
+        FROM Videos v
+        JOIN Users u ON v.user_id = u.user_id
+        WHERE v.type_id = 2
+          AND (%s IS NULL OR v.user_id NOT IN (
+                SELECT blocked_user_id FROM BlockList WHERE user_id = %s
+          ))
+        ORDER BY v.view_count DESC, v.upload_date DESC
+        LIMIT %s OFFSET %s;
+        """
+        # pass user_id twice for the subquery; if user_id is None, the WHERE clause becomes true due to (%s IS NULL OR ...)
+        cur.execute(sql, (user_id, user_id, limit, offset))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
 
-    cur.execute(sql, (shorts_id,))
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-
-    if not row:
-        return jsonify({"error": "Shorts not found"}), 404
-
-    return jsonify(row)
+        return jsonify(rows)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
-# ==================================================
-# 2) 쇼츠 추천
-# ==================================================
-@shorts_bp.route("/shorts/recommend", methods=["GET"])
-def shorts_recommend():
-    user_id = request.args.get("user_id")
-
+# ----------------------------
+# 2) Shorts 상세 (GET)
+#    GET /shorts/detail/<shorts_id>?user_id=3
+# ----------------------------
+@shorts_bp.route("/shorts/detail/<int:shorts_id>", methods=["GET"])
+def shorts_detail(shorts_id):
+    user_id = request.args.get("user_id", type=int)  # optional
     conn = get_db()
     cur = conn.cursor(dictionary=True)
-    
+
     sql = """
-        SELECT s.*,
-            u.username,
-            u.handle,
-            u.profile_img,
-            (SELECT COUNT(*) FROM Shorts_Like 
-             WHERE shorts_id = s.shorts_id AND type='like') AS like_count,
-            (SELECT COUNT(*) FROM Shorts_Like 
-             WHERE shorts_id = s.shorts_id AND type='dislike') AS dislike_count,
-            (SELECT COUNT(*) FROM Shorts_Comment 
-             WHERE shorts_id = s.shorts_id) AS comment_count
-        FROM Shorts s
-        JOIN Users u ON s.user_id = u.user_id
-        WHERE s.shorts_id NOT IN (
-            SELECT shorts_id FROM Shorts_NotInterested WHERE user_id = %s
-        )
-          AND s.user_id NOT IN (
-            SELECT blocked_user_id FROM Channel_Block WHERE user_id = %s
-        )
-        ORDER BY s.views DESC, s.created_at DESC
-        LIMIT 50;
+    SELECT
+        v.*,
+        u.username AS channel_name,
+        IFNULL(l.like_count, 0) AS like_count,
+        IF(vl.user_id IS NULL, 0, 1) AS is_liked
+    FROM Videos v
+    JOIN Users u ON u.user_id = v.user_id
+    LEFT JOIN (
+        SELECT video_id, COUNT(*) AS like_count
+        FROM VideoLikes
+        WHERE is_dislike = 0
+        GROUP BY video_id
+    ) l ON l.video_id = v.video_id
+    LEFT JOIN VideoLikes vl ON vl.video_id = v.video_id AND vl.user_id = %s
+    WHERE v.video_id = %s AND v.type_id = 2
+    LIMIT 1;
     """
-
-    cur.execute(sql, (user_id, user_id))
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-
-    return jsonify(rows)
-
-
-# ==================================================
-# 3) 좋아요 / 싫어요
-# ==================================================
-@shorts_bp.route("/shorts/like", methods=["POST"])
-def shorts_like():
-    shorts_id = request.json.get("shorts_id")
-    user_id = request.json.get("user_id")
-    like_type = request.json.get("type")  # 'like' or 'dislike'
-
-    conn = get_db()
-    cur = conn.cursor(dictionary=True)
-
     try:
-        sql = """
-            INSERT INTO Shorts_Like (shorts_id, user_id, type)
-            VALUES (%s, %s, %s)
-            ON DUPLICATE KEY UPDATE type=%s;
-        """
-
-        cur.execute(sql, (shorts_id, user_id, like_type, like_type))
-        conn.commit()
-        
-        # 좋아요/싫어요 통계 조회
-        cur.execute("""
-            SELECT 
-                s.shorts_id,
-                s.title,
-                u.username,
-                u.handle,
-                COUNT(CASE WHEN sl.type = 'like' THEN 1 END) AS total_likes,
-                COUNT(CASE WHEN sl.type = 'dislike' THEN 1 END) AS total_dislikes,
-                %s AS user_action
-            FROM Shorts s
-            LEFT JOIN Shorts_Like sl ON s.shorts_id = sl.shorts_id
-            JOIN Users u ON s.user_id = u.user_id
-            WHERE s.shorts_id = %s
-            GROUP BY s.shorts_id, s.title, u.username, u.handle
-        """, (like_type, shorts_id))
-        
-        result = cur.fetchone()
-        
-        return jsonify({
-            "message": "OK",
-            "shorts_id": shorts_id,
-            "user_id": user_id,
-            "action": like_type,
-            "stats": result
-        }), 201
-    except Exception as e:
-        conn.rollback()
-        return jsonify({"error": str(e)}), 400
-    finally:
+        cur.execute(sql, (user_id, shorts_id))
+        row = cur.fetchone()
         cur.close()
         conn.close()
 
-
-# ==================================================
-# 4) 관심 없음
-# ==================================================
-@shorts_bp.route("/shorts/not_interested", methods=["POST"])
-def shorts_not_interested():
-    shorts_id = request.json.get("shorts_id")
-    user_id = request.json.get("user_id")
-
-    conn = get_db()
-    cur = conn.cursor(dictionary=True)
-
-    try:
-        sql = """
-            INSERT INTO Shorts_NotInterested (shorts_id, user_id)
-            VALUES (%s, %s)
-            ON DUPLICATE KEY UPDATE created_at = NOW();
-        """
-
-        cur.execute(sql, (shorts_id, user_id))
-        conn.commit()
-        
-        # 관심없음 표시된 쇼츠 정보 조회
-        cur.execute("""
-            SELECT 
-                s.shorts_id,
-                s.title,
-                s.views,
-                u.username AS creator_name,
-                u.handle AS creator_handle,
-                sni.created_at AS marked_at
-            FROM Shorts s
-            JOIN Users u ON s.user_id = u.user_id
-            JOIN Shorts_NotInterested sni ON s.shorts_id = sni.shorts_id
-            WHERE s.shorts_id = %s AND sni.user_id = %s
-        """, (shorts_id, user_id))
-        
-        result = cur.fetchone()
-        
-        return jsonify({
-            "message": "Marked as not interested",
-            "shorts_id": shorts_id,
-            "user_id": user_id,
-            "shorts_info": result
-        }), 201
-    except Exception as e:
-        conn.rollback()
-        return jsonify({"error": str(e)}), 400
-    finally:
-        cur.close()
-        conn.close()
-
-
-# ==================================================
-# 5) 조회수 증가
-# ==================================================
-@shorts_bp.route("/shorts/<int:shorts_id>/view", methods=["PATCH"])
-def shorts_view(shorts_id):
-
-    conn = get_db()
-    cur = conn.cursor(dictionary=True)
-
-    try:
-        sql = """
-            UPDATE Shorts
-            SET views = views + 1
-            WHERE shorts_id = %s;
-        """
-
-        cur.execute(sql, (shorts_id,))
-        conn.commit()
-        
-        # 업데이트된 쇼츠 정보 조회
-        cur.execute("""
-            SELECT 
-                s.shorts_id,
-                s.title,
-                s.views,
-                s.duration_seconds,
-                u.username AS creator_name,
-                u.handle AS creator_handle,
-                u.profile_img AS creator_profile
-            FROM Shorts s
-            JOIN Users u ON s.user_id = u.user_id
-            WHERE s.shorts_id = %s
-        """, (shorts_id,))
-        
-        result = cur.fetchone()
-        
-        if result:
-            return jsonify({
-                "message": "View count increased",
-                "shorts": result
-            }), 200
-        else:
+        if not row:
             return jsonify({"error": "Shorts not found"}), 404
+        return jsonify(row)
     except Exception as e:
-        conn.rollback()
-        return jsonify({"error": str(e)}), 400
-    finally:
         cur.close()
         conn.close()
+        return jsonify({"error": str(e)}), 500
 
 
-# ==================================================
-# 6) 리믹스된 쇼츠 목록 조회
-# ==================================================
-@shorts_bp.route("/shorts/<int:shorts_id>/remix", methods=["GET"])
-def shorts_remix(shorts_id):
+# ----------------------------
+# 3) Shorts Mix 추천 (GET)
+#    GET /shorts/mix?shorts_id=1&user_id=3
+# ----------------------------
+@shorts_bp.route("/shorts/mix", methods=["GET"])
+def shorts_mix():
+    shorts_id = request.args.get("shorts_id", type=int)
+    user_id = request.args.get("user_id", type=int)  # optional
+    if shorts_id is None:
+        return jsonify({"error": "shorts_id required"}), 400
 
     conn = get_db()
     cur = conn.cursor(dictionary=True)
-    
+
     sql = """
-        SELECT s.*,
-            u.username,
-            u.handle,
-            u.profile_img,
-            (SELECT COUNT(*) FROM Shorts_Like 
-             WHERE shorts_id = s.shorts_id AND type='like') AS like_count,
-            (SELECT COUNT(*) FROM Shorts_Comment 
-             WHERE shorts_id = s.shorts_id) AS comment_count
-        FROM Shorts_Remix r
-        JOIN Shorts s ON r.remix_shorts_id = s.shorts_id
-        JOIN Users u ON s.user_id = u.user_id
-        WHERE r.original_shorts_id = %s;
+    SELECT
+        v.video_id AS shorts_id,
+        v.user_id AS channel_id,
+        u.username AS channel_name,
+        v.title,
+        v.video_url,
+        v.thumbnail_url,
+        v.duration,
+        v.view_count
+    FROM Videos v
+    JOIN Users u ON u.user_id = v.user_id
+    WHERE v.type_id = 2
+      AND v.video_id != %s
+      AND (%s IS NULL OR v.user_id NOT IN (SELECT blocked_user_id FROM BlockList WHERE user_id = %s))
+    ORDER BY RAND()
+    LIMIT 20;
     """
+    try:
+        cur.execute(sql, (shorts_id, user_id, user_id))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify(rows)
+    except Exception as e:
+        cur.close()
+        conn.close()
+        return jsonify({"error": str(e)}), 500
 
-    cur.execute(sql, (shorts_id,))
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
 
-    return jsonify(rows)
+# ----------------------------
+# 4) 댓글 리스트 조회 (GET)
+#    GET /shorts/comments/<shorts_id>
+# ----------------------------
+@shorts_bp.route("/shorts/comments/<int:shorts_id>", methods=["GET"])
+def get_comments(shorts_id):
+    conn = get_db()
+    cur = conn.cursor(dictionary=True)
+
+    sql = """
+    SELECT
+        c.comment_id,
+        c.user_id,
+        u.username,
+        c.content,
+        c.parent_id,
+        c.created_at
+    FROM Comments c
+    JOIN Users u ON u.user_id = c.user_id
+    WHERE c.video_id = %s
+    ORDER BY c.created_at ASC;
+    """
+    try:
+        cur.execute(sql, (shorts_id,))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify(rows)
+    except Exception as e:
+        cur.close()
+        conn.close()
+        return jsonify({"error": str(e)}), 500
 
 
-# ==================================================
-# 7) 댓글 등록
-# ==================================================
-@shorts_bp.route("/shorts/comment", methods=["POST"])
+# ----------------------------
+# 5) 댓글 작성 (POST)
+#    POST /shorts/comments
+#    body: { "shorts_id": 1, "user_id": 3, "content": "..." }
+# ----------------------------
+@shorts_bp.route("/shorts/comments", methods=["POST"])
 def comment_write():
     shorts_id = request.json.get("shorts_id")
     user_id = request.json.get("user_id")
     content = request.json.get("content")
+    parent_id = request.json.get("parent_id")  # optional for reply
 
-    conn = get_db()
-    cur = conn.cursor(dictionary=True)
-
-    try:
-        sql = """
-            INSERT INTO Shorts_Comment (shorts_id, user_id, content)
-            VALUES (%s, %s, %s);
-        """
-
-        cur.execute(sql, (shorts_id, user_id, content))
-        comment_id = cur.lastrowid
-        conn.commit()
-        
-        # 생성된 댓글 정보 조회
-        cur.execute("""
-            SELECT c.*, u.username, u.handle, u.profile_img
-            FROM Shorts_Comment c
-            JOIN Users u ON c.user_id = u.user_id
-            WHERE c.comment_id = %s;
-        """, (comment_id,))
-        new_comment = cur.fetchone()
-        
-        return jsonify({
-            "message": "Comment Added",
-            "comment": new_comment
-        }), 201
-    except Exception as e:
-        conn.rollback()
-        return jsonify({"error": str(e)}), 400
-    finally:
-        cur.close()
-        conn.close()
-
-
-# ==================================================
-# 8) 대댓글 등록
-# ==================================================
-@shorts_bp.route("/shorts/reply", methods=["POST"])
-def reply_write():
-    shorts_id = request.json.get("shorts_id")
-    user_id = request.json.get("user_id")
-    parent_id = request.json.get("parent_id")
-    content = request.json.get("content")
-
-    conn = get_db()
-    cur = conn.cursor(dictionary=True)
-
-    try:
-        sql = """
-            INSERT INTO Shorts_Comment (shorts_id, user_id, parent_comment_id, content)
-            VALUES (%s, %s, %s, %s);
-        """
-
-        cur.execute(sql, (shorts_id, user_id, parent_id, content))
-        reply_id = cur.lastrowid
-        conn.commit()
-        
-        # 생성된 대댓글 정보 조회
-        cur.execute("""
-            SELECT c.*, u.username, u.handle, u.profile_img
-            FROM Shorts_Comment c
-            JOIN Users u ON c.user_id = u.user_id
-            WHERE c.comment_id = %s;
-        """, (reply_id,))
-        new_reply = cur.fetchone()
-        
-        return jsonify({
-            "message": "Reply Added",
-            "reply": new_reply
-        }), 201
-    except Exception as e:
-        conn.rollback()
-        return jsonify({"error": str(e)}), 400
-    finally:
-        cur.close()
-        conn.close()
-
-
-# ==================================================
-# 9) 댓글 삭제
-# ==================================================
-@shorts_bp.route("/shorts/comment/<int:comment_id>", methods=["DELETE"])
-def comment_delete(comment_id):
+    if None in (shorts_id, user_id, content):
+        return jsonify({"error": "shorts_id, user_id and content required"}), 400
 
     conn = get_db()
     cur = conn.cursor()
 
     try:
-        # 1. 대댓글 ID들을 먼저 조회
-        cur.execute("SELECT comment_id FROM Shorts_Comment WHERE parent_comment_id = %s;", (comment_id,))
-        reply_ids = [row[0] for row in cur.fetchall()]
-        
-        # 2. 대댓글들의 좋아요 삭제
-        if reply_ids:
-            placeholders = ','.join(['%s'] * len(reply_ids))
-            cur.execute(f"DELETE FROM Comment_Like WHERE comment_id IN ({placeholders});", reply_ids)
-        
-        # 3. 대댓글 삭제
-        cur.execute("DELETE FROM Shorts_Comment WHERE parent_comment_id = %s;", (comment_id,))
-        
-        # 4. 댓글의 좋아요 삭제
-        cur.execute("DELETE FROM Comment_Like WHERE comment_id = %s;", (comment_id,))
-        
-        # 5. 마지막으로 댓글 삭제
-        cur.execute("DELETE FROM Shorts_Comment WHERE comment_id = %s;", (comment_id,))
-        affected_rows = cur.rowcount
-        
-        conn.commit()
-        
-        if affected_rows > 0:
-            return jsonify({
-                "message": "Deleted",
-                "deleted_comment_id": comment_id
-            })
+        if parent_id:
+            sql = """
+            INSERT INTO Comments (video_id, user_id, parent_id, content)
+            VALUES (%s, %s, %s, %s);
+            """
+            cur.execute(sql, (shorts_id, user_id, parent_id, content))
         else:
-            return jsonify({"error": "Comment not found"}), 404
+            sql = """
+            INSERT INTO Comments (video_id, user_id, content)
+            VALUES (%s, %s, %s);
+            """
+            cur.execute(sql, (shorts_id, user_id, content))
+        conn.commit()
+
+        # Recalculate and update Videos.comment_count (cache consistency)
+        cur.execute("""
+            UPDATE Videos v
+            SET v.comment_count = (
+                SELECT COUNT(*) FROM Comments c WHERE c.video_id = v.video_id
+            )
+            WHERE v.video_id = %s;
+        """, (shorts_id,))
+        conn.commit()
+
     except Exception as e:
         conn.rollback()
-        return jsonify({"error": str(e)}), 400
-    finally:
         cur.close()
         conn.close()
+        return jsonify({"error": str(e)}), 500
+
+    cur.close()
+    conn.close()
+    return jsonify({"message": "Comment Added"}), 201
 
 
-# ==================================================
-# 10) 특정 쇼츠 댓글수 조회
-# ==================================================
-@shorts_bp.route("/shorts/<int:shorts_id>/comment_count", methods=["GET"])
-def comment_count(shorts_id):
+# ----------------------------
+# 6) 댓글 삭제 (DELETE)
+#    DELETE /shorts/comments/<comment_id>?user_id=3
+# ----------------------------
+@shorts_bp.route("/shorts/comments/<int:comment_id>", methods=["DELETE"])
+def comment_delete(comment_id):
+    user_id = request.args.get("user_id", type=int)
+    if user_id is None:
+        return jsonify({"error": "user_id required"}), 400
 
     conn = get_db()
     cur = conn.cursor(dictionary=True)
-    
-    sql = """
-        SELECT COUNT(*) AS comment_count
-        FROM Shorts_Comment
-        WHERE shorts_id = %s;
-    """
 
-    cur.execute(sql, (shorts_id,))
-    row = cur.fetchone()
+    try:
+        # 확인: 댓글 소유자인지 가져오기
+        cur.execute("SELECT video_id, user_id FROM Comments WHERE comment_id = %s;", (comment_id,))
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Comment not found"}), 404
+
+        if row["user_id"] != user_id:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Unauthorized"}), 403
+
+        video_id = row["video_id"]
+
+        # 삭제
+        cur.execute("DELETE FROM Comments WHERE comment_id = %s;", (comment_id,))
+        conn.commit()
+
+        # 갱신: 댓글 카운트
+        cur.execute("""
+            UPDATE Videos v
+            SET v.comment_count = (
+                SELECT COUNT(*) FROM Comments c WHERE c.video_id = v.video_id
+            )
+            WHERE v.video_id = %s;
+        """, (video_id,))
+        conn.commit()
+
+        cur.close()
+        conn.close()
+        return jsonify({"message": "Deleted"})
+    except Exception as e:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+# ----------------------------
+# 7) 좋아요 / 싫어요 조회 (GET)
+#    GET /shorts/likes/<shorts_id>?user_id=3
+# ----------------------------
+@shorts_bp.route("/shorts/likes/<int:shorts_id>", methods=["GET"])
+def likes_info(shorts_id):
+    user_id = request.args.get("user_id", type=int)
+    conn = get_db()
+    cur = conn.cursor(dictionary=True)
+
+    try:
+        # like_count (is_dislike = 0)
+        cur.execute("SELECT COUNT(*) AS like_count FROM VideoLikes WHERE video_id = %s AND is_dislike = 0;", (shorts_id,))
+        like_row = cur.fetchone()
+        like_count = like_row["like_count"] if like_row else 0
+
+        # dislike_count (optional)
+        cur.execute("SELECT COUNT(*) AS dislike_count FROM VideoLikes WHERE video_id = %s AND is_dislike = 1;", (shorts_id,))
+        dis_row = cur.fetchone()
+        dislike_count = dis_row["dislike_count"] if dis_row else 0
+
+        is_liked = 0
+        is_disliked = 0
+        if user_id:
+            cur.execute("SELECT is_dislike FROM VideoLikes WHERE video_id = %s AND user_id = %s;", (shorts_id, user_id))
+            r = cur.fetchone()
+            if r:
+                if r.get("is_dislike") in (1, True):
+                    is_disliked = 1
+                else:
+                    is_liked = 1
+
+        cur.close()
+        conn.close()
+        return jsonify({
+            "like_count": like_count,
+            "dislike_count": dislike_count,
+            "is_liked": is_liked,
+            "is_disliked": is_disliked
+        })
+    except Exception as e:
+        cur.close()
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+
+# ----------------------------
+# 8) 좋아요/싫어요 추가 (POST)
+#    POST /shorts/likes/<shorts_id>
+#    body: { "user_id": 3, "type": "like" } # type: "like" or "dislike"
+# ----------------------------
+@shorts_bp.route("/shorts/likes/<int:shorts_id>", methods=["POST"])
+def like_action(shorts_id):
+    user_id = request.json.get("user_id")
+    like_type = request.json.get("type", "like")  # default to like
+
+    if None in (shorts_id, user_id, like_type):
+        return jsonify({"error": "shorts_id, user_id and type required"}), 400
+
+    is_dislike = 1 if like_type == "dislike" else 0
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+        # upsert pattern: if exists update, else insert
+        sql = """
+        INSERT INTO VideoLikes (video_id, user_id, is_dislike, created_at)
+        VALUES (%s, %s, %s, NOW())
+        ON DUPLICATE KEY UPDATE is_dislike = VALUES(is_dislike), created_at = NOW();
+        """
+        cur.execute(sql, (shorts_id, user_id, is_dislike))
+        conn.commit()
+
+        # Recalculate and update Videos.like_count (only non-dislike)
+        cur.execute("""
+            UPDATE Videos v
+            SET v.like_count = (
+                SELECT COUNT(*) FROM VideoLikes vl WHERE vl.video_id = v.video_id AND vl.is_dislike = 0
+            )
+            WHERE v.video_id = %s;
+        """, (shorts_id,))
+        conn.commit()
+
+    except Exception as e:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
     cur.close()
     conn.close()
+    return jsonify({"message": "OK"})
 
-    return jsonify(row)
+
+# ----------------------------
+# 9) 좋아요/싫어요 취소 (DELETE)
+#    DELETE /shorts/likes/<shorts_id>?user_id=3
+# ----------------------------
+@shorts_bp.route("/shorts/likes/<int:shorts_id>", methods=["DELETE"])
+def unlike_action(shorts_id):
+    user_id = request.args.get("user_id", type=int)
+    if user_id is None:
+        return jsonify({"error": "user_id required"}), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("DELETE FROM VideoLikes WHERE video_id = %s AND user_id = %s;", (shorts_id, user_id))
+        conn.commit()
+
+        # Recalculate and update Videos.like_count
+        cur.execute("""
+            UPDATE Videos v
+            SET v.like_count = (
+                SELECT COUNT(*) FROM VideoLikes vl WHERE vl.video_id = v.video_id AND vl.is_dislike = 0
+            )
+            WHERE v.video_id = %s;
+        """, (shorts_id,))
+        conn.commit()
+
+    except Exception as e:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+    cur.close()
+    conn.close()
+    return jsonify({"message": "Deleted"})

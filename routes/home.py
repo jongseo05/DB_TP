@@ -45,20 +45,22 @@ def home_time():
         SELECT 
             V.video_id,
             V.title,
-            V.category,
-            V.views,
+            VT.type_name AS video_type,
+            V.view_count,
             V.upload_date,
             U.user_id,
-            U.username AS uploader_name,   -- name → username
-            U.profile_img,                 -- profile_image → profile_img
-            CASE 
-                WHEN HOUR(NOW()) BETWEEN 18 AND 23 AND V.category = '게임' THEN 10
-                WHEN HOUR(NOW()) BETWEEN 6 AND 17 AND V.category = '뉴스' THEN 10
+            U.username AS uploader_name,
+            U.profile_img,
+            CASE
+                WHEN HOUR(NOW()) BETWEEN 18 AND 23 AND VT.type_name = 'video'  THEN 10
+                WHEN HOUR(NOW()) BETWEEN  6 AND 17 AND VT.type_name = 'shorts' THEN 10
                 ELSE 1
-            END AS category_weight
+            END AS type_weight
         FROM Videos V
         JOIN Users U ON U.user_id = V.user_id
-        ORDER BY (V.views * category_weight) DESC, V.upload_date DESC
+        JOIN VideoType VT ON V.type_id = VT.type_id
+        WHERE V.visibility = 'public'
+        ORDER BY (V.view_count * type_weight) DESC, V.upload_date DESC
         LIMIT 20;
     """
 
@@ -88,20 +90,21 @@ def recent_watch():
             wh.watched_at,
             v.video_id,
             v.title,
-            v.category,
+            vt.type_name AS video_type,
             CASE
-                WHEN v.views >= 100000000 THEN CONCAT(ROUND(v.views / 100000000, 1), '억')
-                WHEN v.views >= 10000       THEN CONCAT(ROUND(v.views / 10000, 1), '만')
-                ELSE v.views
+                WHEN v.view_count >= 100000000 THEN CONCAT(ROUND(v.view_count / 100000000, 1), '억')
+                WHEN v.view_count >= 10000       THEN CONCAT(ROUND(v.view_count / 10000, 1), '만')
+                ELSE v.view_count
             END AS pretty_views,
-            v.views AS raw_views,
+            v.view_count AS raw_views,
             v.upload_date,
             u.user_id AS creator_id,
-            u.username AS creator_name,              -- name → username
-            u.profile_img AS creator_profile_image   -- profile_image → profile_img
+            u.username AS creator_name,
+            u.profile_img AS creator_profile_image
         FROM WatchHistory wh
         JOIN Videos v ON wh.video_id = v.video_id
         JOIN Users u  ON v.user_id  = u.user_id
+        JOIN VideoType vt ON v.type_id = vt.type_id
         WHERE wh.user_id = %s
         ORDER BY wh.watched_at DESC
         LIMIT 5;
@@ -119,7 +122,7 @@ def recent_watch():
 
 
 # ==================================================
-# 3) 광고 추천
+# 3) 광고 추천 (최근 7일 시청 기록 기반)
 # ==================================================
 @home_bp.route("/ads/recommend", methods=["GET"])
 def ads_recommend():
@@ -129,41 +132,43 @@ def ads_recommend():
     cur = conn.cursor(dictionary=True)
 
     query = """
-        SELECT 
-          COALESCE(topcat.category, 'General') AS category,
-          CASE COALESCE(topcat.category, 'General')
-            WHEN '게임' THEN '🔥 요즘 뜨는 신작 게임 광고!'
-            WHEN '음식' THEN '🍜 지금 가장 핫한 맛집 할인 광고!'
-            WHEN 'IT'   THEN '💻 최신 전자제품 신상 광고!'
-            WHEN '지식' THEN '📘 똑똑해지는 지식 콘텐츠 광고!'
-            WHEN '운동' THEN '🏋️ 헬스 용품 광고!'
-            ELSE '📢 맞춤형 광고가 준비되어 있습니다!'
-          END AS recommended_ad,
-          CASE COALESCE(topcat.category, 'General')
-            WHEN '게임' THEN 'https://cdn.example.com/ad/game_banner.png'
-            WHEN '음식' THEN 'https://cdn.example.com/ad/food_banner.jpg'
-            WHEN 'IT'   THEN 'https://cdn.example.com/ad/tech_banner.png'
-            WHEN '지식' THEN 'https://cdn.example.com/ad/knowledge_banner.jpg'
-            WHEN '운동' THEN 'https://cdn.example.com/ad/workout_banner.png'
-            ELSE 'https://cdn.example.com/ad/default_banner.png'
-          END AS ad_image_url
+        SELECT
+            top_type.type_name AS video_type,
+            CASE
+                WHEN top_type.type_name = 'video'  THEN '일반 동영상 광고'
+                WHEN top_type.type_name = 'shorts' THEN '쇼츠 전용 광고'
+                WHEN top_type.type_name = 'live'   THEN '라이브 스트리밍 광고'
+                ELSE '기본 광고'
+            END AS recommended_ad,
+            CASE
+                WHEN top_type.type_name = 'video'  THEN 'https://cdn.example.com/ad/video_banner.png'
+                WHEN top_type.type_name = 'shorts' THEN 'https://cdn.example.com/ad/shorts_banner.png'
+                WHEN top_type.type_name = 'live'   THEN 'https://cdn.example.com/ad/live_banner.png'
+                ELSE 'https://cdn.example.com/ad/default_banner.png'
+            END AS ad_image_url
         FROM (
-            SELECT v.category
+            SELECT vt.type_name
             FROM WatchHistory wh
-            JOIN Videos v ON wh.video_id = v.video_id
+            JOIN Videos v    ON wh.video_id = v.video_id
+            JOIN VideoType vt ON v.type_id  = vt.type_id
             WHERE wh.user_id = %s
               AND wh.watched_at >= NOW() - INTERVAL 7 DAY
-            GROUP BY v.category
+            GROUP BY vt.type_name
             ORDER BY COUNT(*) DESC
             LIMIT 1
-        ) AS topcat
-        UNION ALL
-        SELECT 'General', '📢 맞춤형 광고가 준비되어 있습니다!', 'https://cdn.example.com/ad/default_banner.png'
-        LIMIT 1;
+        ) AS top_type;
     """
 
     cur.execute(query, (user_id,))
     row = cur.fetchone()
+    
+    # 시청 기록이 없으면 기본 광고
+    if not row:
+        row = {
+            "video_type": "General",
+            "recommended_ad": "기본 광고",
+            "ad_image_url": "https://cdn.example.com/ad/default_banner.png"
+        }
 
     cur.close()
     conn.close()
@@ -193,21 +198,22 @@ def top_creators():
         SELECT 
             v.video_id,
             v.user_id AS creator_id,
-            u.username AS creator_name,              -- name → username
-            u.profile_img AS creator_profile_image,  -- profile_image → profile_img
+            u.username AS creator_name,
+            u.profile_img AS creator_profile_image,
             v.title,
-            v.category,
+            vt.type_name AS video_type,
             CASE
-                WHEN v.views >= 100000000 THEN CONCAT(ROUND(v.views / 100000000, 1), '억')
-                WHEN v.views >= 10000       THEN CONCAT(ROUND(v.views / 10000, 1), '만')
-                ELSE v.views
+                WHEN v.view_count >= 100000000 THEN CONCAT(ROUND(v.view_count / 100000000, 1), '억')
+                WHEN v.view_count >= 10000       THEN CONCAT(ROUND(v.view_count / 10000, 1), '만')
+                ELSE v.view_count
             END AS pretty_views,
-            v.views AS raw_views,
+            v.view_count AS raw_views,
             v.upload_date
         FROM Videos v
         JOIN top_creators tc ON v.user_id = tc.creator_id
         JOIN Users u         ON v.user_id = u.user_id
-        ORDER BY v.views DESC
+        JOIN VideoType vt    ON v.type_id = vt.type_id
+        ORDER BY v.view_count DESC, v.upload_date DESC
         LIMIT 4;
     """
 
@@ -220,28 +226,41 @@ def top_creators():
 
 
 # ==================================================
-# 5) 랜덤 게시물 + 댓글 1개
+# 5) 랜덤 게시물 + 베스트 댓글 1개
 # ==================================================
 @home_bp.route("/post/random", methods=["GET"])
 def post_random():
     conn = get_db()
     cur = conn.cursor(dictionary=True)
 
-    # Videos 테이블에서 일반 영상 1개 랜덤 선택 (type_code='video')
+    # Videos 테이블에서 일반 영상 1개 랜덤 선택 + 베스트 댓글
     query_post = """
         SELECT 
-            v.video_id AS post_id,
-            v.title,
-            v.description AS post_text,
-            v.upload_date,
-            v.views,
+            p.video_id AS post_id,
+            p.title,
+            p.description AS post_text,
+            p.upload_date,
+            p.view_count AS views,
+            u.user_id AS author_id,
             u.username AS author_name,
-            u.profile_img AS author_profile_url
-        FROM Videos v
-        JOIN Users u ON v.user_id = u.user_id
-        JOIN VideoType vt ON v.type_id = vt.type_id
-        WHERE vt.type_code = 'video'
-          AND v.visibility = 'public'
+            u.profile_img AS author_profile_url,
+            c_top.content AS top_comment,
+            c_top.like_count AS top_comment_likes,
+            u_top.username AS top_comment_user,
+            u_top.profile_img AS top_comment_user_profile
+        FROM Videos p
+        JOIN Users u ON p.user_id = u.user_id
+        LEFT JOIN Comments c_top
+          ON c_top.comment_id = (
+            SELECT c2.comment_id
+            FROM Comments c2
+            WHERE c2.video_id = p.video_id
+              AND c2.parent_id IS NULL
+            ORDER BY c2.like_count DESC, c2.created_at ASC
+            LIMIT 1
+          )
+        LEFT JOIN Users u_top ON c_top.user_id = u_top.user_id
+        WHERE p.visibility = 'public'
         ORDER BY RAND()
         LIMIT 1;
     """
@@ -254,7 +273,6 @@ def post_random():
         return jsonify({"error": "No video found"}), 404
 
     post["uploaded_before"] = time_ago(post["upload_date"])
-    post["top_comment"] = None  # 댓글은 별도 테이블이 없으므로 null
 
     cur.close()
     conn.close()
@@ -269,20 +287,23 @@ def shorts_random():
     conn = get_db()
     cur = conn.cursor(dictionary=True)
 
-    # Shorts 테이블에서 랜덤 쇼츠 조회
+    # Videos 테이블에서 type_name='shorts'인 영상 조회
     query = """
         SELECT
-            s.shorts_id AS short_id,
-            s.thumbnail_url,
+            v.video_id AS short_id,
+            v.thumbnail_url AS short_thumbnail,
             CASE
-                WHEN CHAR_LENGTH(s.title) > 12 THEN CONCAT(LEFT(s.title, 12), '…')
-                ELSE s.title
+                WHEN CHAR_LENGTH(v.title) > 12 THEN CONCAT(LEFT(v.title, 12), '…')
+                ELSE v.title
             END AS short_title,
-            s.views,
+            v.view_count AS views,
             u.username,
             u.profile_img
-        FROM Shorts s
-        JOIN Users u ON s.user_id = u.user_id
+        FROM Videos v
+        JOIN Users u ON v.user_id = u.user_id
+        JOIN VideoType vt ON v.type_id = vt.type_id
+        WHERE vt.type_name = 'shorts'
+          AND v.visibility = 'public'
         ORDER BY RAND()
         LIMIT 6;
     """
@@ -313,20 +334,22 @@ def home_full():
         SELECT 
             V.video_id,
             V.title,
-            V.category,
-            V.views,
+            VT.type_name AS video_type,
+            V.view_count,
             V.upload_date,
             U.user_id,
             U.username AS uploader_name,
             U.profile_img,
-            CASE 
-                WHEN HOUR(NOW()) BETWEEN 18 AND 23 AND V.category = '게임' THEN 10
-                WHEN HOUR(NOW()) BETWEEN 6 AND 17 AND V.category = '뉴스' THEN 10
+            CASE
+                WHEN HOUR(NOW()) BETWEEN 18 AND 23 AND VT.type_name = 'video'  THEN 10
+                WHEN HOUR(NOW()) BETWEEN  6 AND 17 AND VT.type_name = 'shorts' THEN 10
                 ELSE 1
-            END AS category_weight
+            END AS type_weight
         FROM Videos V
         JOIN Users U ON U.user_id = V.user_id
-        ORDER BY (V.views * category_weight) DESC, V.upload_date DESC
+        JOIN VideoType VT ON V.type_id = VT.type_id
+        WHERE V.visibility = 'public'
+        ORDER BY (V.view_count * type_weight) DESC, V.upload_date DESC
         LIMIT 20;
     """)
     rows = cur.fetchall()
@@ -341,13 +364,13 @@ def home_full():
             wh.watched_at,
             v.video_id,
             v.title,
-            v.category,
+            vt.type_name AS video_type,
             CASE
-                WHEN v.views >= 100000000 THEN CONCAT(ROUND(v.views / 100000000, 1), '억')
-                WHEN v.views >= 10000       THEN CONCAT(ROUND(v.views / 10000, 1), '만')
-                ELSE v.views
+                WHEN v.view_count >= 100000000 THEN CONCAT(ROUND(v.view_count / 100000000, 1), '억')
+                WHEN v.view_count >= 10000       THEN CONCAT(ROUND(v.view_count / 10000, 1), '만')
+                ELSE v.view_count
             END AS pretty_views,
-            v.views AS raw_views,
+            v.view_count AS raw_views,
             v.upload_date,
             u.user_id AS creator_id,
             u.username AS creator_name,
@@ -355,6 +378,7 @@ def home_full():
         FROM WatchHistory wh
         JOIN Videos v ON wh.video_id = v.video_id
         JOIN Users u  ON v.user_id  = u.user_id
+        JOIN VideoType vt ON v.type_id = vt.type_id
         WHERE wh.user_id = %s
         ORDER BY wh.watched_at DESC
         LIMIT 5;
@@ -366,42 +390,42 @@ def home_full():
     result["recent_watched"] = rows
 
     # ----------------------
-    # 광고
-    query = """
-        SELECT 
-          COALESCE(topcat.category, 'General') AS category,
-          CASE COALESCE(topcat.category, 'General')
-            WHEN '게임' THEN '🔥 요즘 뜨는 신작 게임 광고!'
-            WHEN '음식' THEN '🍜 지금 가장 핫한 맛집 할인 광고!'
-            WHEN 'IT'   THEN '💻 최신 전자제품 신상 광고!'
-            WHEN '지식' THEN '📘 똑똑해지는 지식 콘텐츠 광고!'
-            WHEN '운동' THEN '🏋️ 헬스 용품 광고!'
-            ELSE '📢 맞춤형 광고가 준비되어 있습니다!'
-          END AS recommended_ad,
-          CASE COALESCE(topcat.category, 'General')
-            WHEN '게임' THEN 'https://cdn.example.com/ad/game_banner.png'
-            WHEN '음식' THEN 'https://cdn.example.com/ad/food_banner.jpg'
-            WHEN 'IT'   THEN 'https://cdn.example.com/ad/tech_banner.png'
-            WHEN '지식' THEN 'https://cdn.example.com/ad/knowledge_banner.jpg'
-            WHEN '운동' THEN 'https://cdn.example.com/ad/workout_banner.png'
-            ELSE 'https://cdn.example.com/ad/default_banner.png'
-          END AS ad_image_url
+    # 광고 (최근 7일 시청 기록 기반)
+    cur.execute("""
+        SELECT
+            top_type.type_name AS video_type,
+            CASE
+                WHEN top_type.type_name = 'video'  THEN '일반 동영상 광고'
+                WHEN top_type.type_name = 'shorts' THEN '쇼츠 전용 광고'
+                WHEN top_type.type_name = 'live'   THEN '라이브 스트리밍 광고'
+                ELSE '기본 광고'
+            END AS recommended_ad,
+            CASE
+                WHEN top_type.type_name = 'video'  THEN 'https://cdn.example.com/ad/video_banner.png'
+                WHEN top_type.type_name = 'shorts' THEN 'https://cdn.example.com/ad/shorts_banner.png'
+                WHEN top_type.type_name = 'live'   THEN 'https://cdn.example.com/ad/live_banner.png'
+                ELSE 'https://cdn.example.com/ad/default_banner.png'
+            END AS ad_image_url
         FROM (
-            SELECT v.category
+            SELECT vt.type_name
             FROM WatchHistory wh
-            JOIN Videos v ON wh.video_id = v.video_id
+            JOIN Videos v    ON wh.video_id = v.video_id
+            JOIN VideoType vt ON v.type_id  = vt.type_id
             WHERE wh.user_id = %s
               AND wh.watched_at >= NOW() - INTERVAL 7 DAY
-            GROUP BY v.category
+            GROUP BY vt.type_name
             ORDER BY COUNT(*) DESC
             LIMIT 1
-        ) AS topcat
-        UNION ALL
-        SELECT 'General', '📢 맞춤형 광고가 준비되어 있습니다!', 'https://cdn.example.com/ad/default_banner.png'
-        LIMIT 1;
-    """
-    cur.execute(query, (user_id,))
-    result["ads"] = cur.fetchone()
+        ) AS top_type;
+    """, (user_id,))
+    ad_row = cur.fetchone()
+    if not ad_row:
+        ad_row = {
+            "video_type": "General",
+            "recommended_ad": "기본 광고",
+            "ad_image_url": "https://cdn.example.com/ad/default_banner.png"
+        }
+    result["ads"] = ad_row
 
     # ----------------------
     # TOP2 → 조회수 TOP4
@@ -421,63 +445,79 @@ def home_full():
             u.username AS creator_name,
             u.profile_img AS creator_profile_image,
             v.title,
-            v.category,
+            vt.type_name AS video_type,
             CASE
-                WHEN v.views >= 100000000 THEN CONCAT(ROUND(v.views / 100000000, 1), '억')
-                WHEN v.views >= 10000       THEN CONCAT(ROUND(v.views / 10000, 1), '만')
-                ELSE v.views
+                WHEN v.view_count >= 100000000 THEN CONCAT(ROUND(v.view_count / 100000000, 1), '억')
+                WHEN v.view_count >= 10000       THEN CONCAT(ROUND(v.view_count / 10000, 1), '만')
+                ELSE v.view_count
             END AS pretty_views,
-            v.views AS raw_views,
+            v.view_count AS raw_views,
             v.upload_date
         FROM Videos v
         JOIN top_creators tc ON v.user_id = tc.creator_id
         JOIN Users u         ON v.user_id = u.user_id
-        ORDER BY v.views DESC
+        JOIN VideoType vt    ON v.type_id = vt.type_id
+        ORDER BY v.view_count DESC, v.upload_date DESC
         LIMIT 4;
     """
     cur.execute(query, (user_id,))
     result["top_creators"] = cur.fetchall()
 
     # ----------------------
-    # 랜덤 영상 (type_code='video')
+    # 랜덤 영상 (type_name='video') + 베스트 댓글
     cur.execute("""
         SELECT 
-            v.video_id AS post_id,
-            v.title,
-            v.description AS post_text,
-            v.upload_date,
-            v.views,
+            p.video_id AS post_id,
+            p.title,
+            p.description AS post_text,
+            p.upload_date,
+            p.view_count AS views,
+            u.user_id AS author_id,
             u.username AS author_name,
-            u.profile_img AS author_profile_url
-        FROM Videos v
-        JOIN Users u ON v.user_id = u.user_id
-        JOIN VideoType vt ON v.type_id = vt.type_id
-        WHERE vt.type_code = 'video'
-          AND v.visibility = 'public'
+            u.profile_img AS author_profile_url,
+            c_top.content AS top_comment,
+            c_top.like_count AS top_comment_likes,
+            u_top.username AS top_comment_user,
+            u_top.profile_img AS top_comment_user_profile
+        FROM Videos p
+        JOIN Users u ON p.user_id = u.user_id
+        LEFT JOIN Comments c_top
+          ON c_top.comment_id = (
+            SELECT c2.comment_id
+            FROM Comments c2
+            WHERE c2.video_id = p.video_id
+              AND c2.parent_id IS NULL
+            ORDER BY c2.like_count DESC, c2.created_at ASC
+            LIMIT 1
+          )
+        LEFT JOIN Users u_top ON c_top.user_id = u_top.user_id
+        WHERE p.visibility = 'public'
         ORDER BY RAND()
         LIMIT 1;
     """)
     post = cur.fetchone()
     if post:
         post["uploaded_before"] = time_ago(post["upload_date"])
-        post["top_comment"] = None
     result["random_post"] = post
 
     # ----------------------
-    # 랜덤 숏츠 (Shorts 테이블)
+    # 랜덤 숏츠 (Videos 테이블에서 type_name='shorts')
     cur.execute("""
         SELECT
-            s.shorts_id AS short_id,
-            s.thumbnail_url,
+            v.video_id AS short_id,
+            v.thumbnail_url AS short_thumbnail,
             CASE
-                WHEN CHAR_LENGTH(s.title) > 12 THEN CONCAT(LEFT(s.title, 12), '…')
-                ELSE s.title
+                WHEN CHAR_LENGTH(v.title) > 12 THEN CONCAT(LEFT(v.title, 12), '…')
+                ELSE v.title
             END AS short_title,
-            s.views,
+            v.view_count AS views,
             u.username,
             u.profile_img
-        FROM Shorts s
-        JOIN Users u ON s.user_id = u.user_id
+        FROM Videos v
+        JOIN Users u ON v.user_id = u.user_id
+        JOIN VideoType vt ON v.type_id = vt.type_id
+        WHERE vt.type_name = 'shorts'
+          AND v.visibility = 'public'
         ORDER BY RAND()
         LIMIT 6;
     """)

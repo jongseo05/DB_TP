@@ -1,4 +1,3 @@
-# routes/subscriptions.py
 from flask import Blueprint, request, jsonify
 from db import get_db
 import datetime
@@ -79,15 +78,14 @@ def get_feed(user_id):
         v.duration,
         v.upload_date,
         TIMESTAMPDIFF(MINUTE, v.upload_date, NOW()) AS minutes_diff,
-        vt.type_code,
+                vt.type_name,
         u.user_id AS channel_id,
         u.username AS channel_name,
         u.profile_img AS channel_profile,
-        COALESCE(vs.view_count, v.views, 0) AS view_count
+                COALESCE(v.view_count, 0) AS view_count
     FROM Subscriptions s
     JOIN Videos v ON s.channel_id = v.user_id
     JOIN Users u ON u.user_id = v.user_id
-    LEFT JOIN VideoStats vs ON vs.video_id = v.video_id
     JOIN VideoType vt ON vt.type_id = v.type_id
     WHERE s.subscriber_id = %s
       AND v.visibility = 'public'
@@ -97,7 +95,7 @@ def get_feed(user_id):
 
     # 타입 필터
     if filter_type and filter_type != "all":
-        query += " AND vt.type_code = %s "
+        query += " AND vt.type_name = %s "
         params.append(filter_type)
 
     # 오늘 업로드
@@ -120,8 +118,9 @@ def get_feed(user_id):
             SELECT wh.video_id
             FROM WatchHistory wh
             WHERE wh.user_id = %s
-              AND wh.duration_watched IS NOT NULL
-              AND wh.duration_watched < v.duration
+                            AND wh.last_position IS NOT NULL
+                            AND wh.last_position > 0
+                            AND wh.last_position < v.duration
         )
         """
         params.append(user_id)
@@ -188,7 +187,7 @@ def subscribe_channel(user_id, channel_id):
             """
             INSERT INTO Subscriptions (subscriber_id, channel_id)
             VALUES (%s, %s)
-            ON DUPLICATE KEY UPDATE subscribed_at = CURRENT_TIMESTAMP
+            ON DUPLICATE KEY UPDATE created_at = CURRENT_TIMESTAMP
             """,
             (user_id, channel_id)
         )
@@ -203,7 +202,7 @@ def subscribe_channel(user_id, channel_id):
                 s.channel_id,
                 u2.username AS channel_name,
                 u2.handle AS channel_handle,
-                s.subscribed_at
+                s.created_at
             FROM Subscriptions s
             JOIN Users u1 ON s.subscriber_id = u1.user_id
             JOIN Users u2 ON s.channel_id = u2.user_id
@@ -330,5 +329,3 @@ def get_subscriptions(user_id):
         "limit": limit,
         "offset": offset
     })
-
-

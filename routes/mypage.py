@@ -1,398 +1,523 @@
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, request, jsonify
 from db import get_db
-import datetime
+from datetime import datetime
 
 yt_bp = Blueprint("yt", __name__)
 
-# --------------------------------------------------
-# 상대 시간 변환 함수 (“3일 전”, “2개월 전”)
-# --------------------------------------------------
-def time_ago(dt):
-    if dt is None:
-        return None
-    if isinstance(dt, str):
-        try:
-            # 가능하면 문자열도 datetime으로 변환
-            dt = datetime.datetime.fromisoformat(dt)
-        except Exception:
-            return dt
-
-    now = datetime.datetime.now()
-    delta = now - dt
-
-    if delta.days < 1:
-        return "오늘"
-    elif delta.days < 30:
-        return f"{delta.days}일 전"
-    elif delta.days < 365:
-        return f"{delta.days // 30}개월 전"
-    else:
-        return f"{delta.days // 365}년 전"
-
 
 # ============================================================
-# 1) 프로필 + 요약
-#    POST /yt_profile
+# 1) Profile + Summary
+#    GET /yt_profile/<user_id>
 # ============================================================
 @yt_bp.route("/yt_profile/<int:user_id>", methods=["GET"])
 def yt_profile(user_id):
-
+    """프로필 정보 + 각종 요약 통계"""
     conn = get_db()
     cur = conn.cursor(dictionary=True)
 
-    query = """
+    # 프로필 정보
+    cur.execute("""
         SELECT 
-            u.user_id, u.username, u.handle, u.profile_img, u.join_date,
-            (SELECT COUNT(*) FROM WatchHistory h WHERE h.user_id = u.user_id) AS history_count,
-            (SELECT COUNT(*) FROM Playlists p WHERE p.user_id = u.user_id) AS playlist_count,
-            (SELECT COUNT(*) FROM Videos v WHERE v.user_id = u.user_id) AS upload_count,
-            (SELECT COUNT(*) FROM OfflineVideo o WHERE o.user_id = u.user_id) AS offline_count,
-            (SELECT COUNT(*) FROM MoviePurchase mp WHERE mp.user_id = u.user_id) AS movie_count,
-            (SELECT COUNT(*) FROM Premium pr WHERE pr.user_id = u.user_id AND pr.is_active = TRUE) AS premium_active,
-            (SELECT COUNT(*) FROM Support s WHERE s.user_id = u.user_id AND s.status='open') AS open_support
-        FROM Users u
-        WHERE u.user_id = %s;
-    """
+            user_id, 
+            username, 
+            handle, 
+            profile_img, 
+            subscriber_count, 
+            join_date
+        FROM Users
+        WHERE user_id = %s
+    """, (user_id,))
+    profile = cur.fetchone()
 
-    cur.execute(query, (user_id,))
-    row = cur.fetchone()
+    if not profile:
+        cur.close()
+        conn.close()
+        return jsonify({"success": False, "error": "User not found"}), 404
+
+    # 요약 정보
+    summary = {}
+
+    # 시청 기록 수
+    cur.execute("""
+        SELECT COUNT(*) AS cnt 
+        FROM WatchHistory 
+        WHERE user_id = %s
+    """, (user_id,))
+    summary["watch_history_count"] = cur.fetchone()["cnt"]
+
+    # 재생목록 수
+    cur.execute("""
+        SELECT COUNT(*) AS cnt 
+        FROM Playlists 
+        WHERE user_id = %s
+    """, (user_id,))
+    summary["playlist_count"] = cur.fetchone()["cnt"]
+
+    # 업로드 영상 수
+    cur.execute("""
+        SELECT COUNT(*) AS cnt 
+        FROM Videos 
+        WHERE user_id = %s
+    """, (user_id,))
+    summary["uploaded_count"] = cur.fetchone()["cnt"]
+
+    # 오프라인 저장 수
+    cur.execute("""
+        SELECT COUNT(*) AS cnt 
+        FROM OfflineVideo 
+        WHERE user_id = %s
+    """, (user_id,))
+    summary["offline_count"] = cur.fetchone()["cnt"]
+
+    # 영화 구매 수
+    cur.execute("""
+        SELECT COUNT(*) AS cnt 
+        FROM MoviePurchases 
+        WHERE user_id = %s
+    """, (user_id,))
+    summary["movie_purchase_count"] = cur.fetchone()["cnt"]
+
+    # Premium 여부
+    cur.execute("""
+        SELECT 
+            plan_type, 
+            start_date, 
+            end_date
+        FROM Premium 
+        WHERE user_id = %s
+    """, (user_id,))
+    premium_info = cur.fetchone()
+    if premium_info:
+        # is_active를 Python에서 계산 (end_date > 현재 시간)
+        if premium_info.get("end_date"):
+            premium_info["is_active"] = premium_info["end_date"] > datetime.now()
+        else:
+            premium_info["is_active"] = False
+    summary["premium"] = premium_info if premium_info else None
+
+    # 고객센터 문의 수
+    cur.execute("""
+        SELECT COUNT(*) AS cnt 
+        FROM SupportTickets 
+        WHERE user_id = %s
+    """, (user_id,))
+    summary["support_ticket_count"] = cur.fetchone()["cnt"]
+
     cur.close()
     conn.close()
 
-    if row:
-        if isinstance(row.get("join_date"), (datetime.date, datetime.datetime)):
-            row["join_date"] = str(row["join_date"])
+    # datetime 변환
+    if profile.get("join_date"):
+        profile["join_date"] = profile["join_date"].strftime('%Y-%m-%d %H:%M:%S')
+    
+    if summary["premium"]:
+        if summary["premium"].get("start_date"):
+            summary["premium"]["start_date"] = summary["premium"]["start_date"].strftime('%Y-%m-%d %H:%M:%S')
+        if summary["premium"].get("end_date"):
+            summary["premium"]["end_date"] = summary["premium"]["end_date"].strftime('%Y-%m-%d %H:%M:%S')
 
-    return jsonify(row)
+    return jsonify({
+        "success": True,
+        "profile": profile,
+        "summary": summary
+    })
 
 
 # ============================================================
-# 2) 시청 기록 (동영상/쇼츠/라이브 필터)
-#    POST /yt_history
+# 2) Watch History (Videos + Shorts + Live)
+#    GET /yt_history?user_id=<user_id>&type=<all|video|shorts|live>
 # ============================================================
 @yt_bp.route("/yt_history", methods=["GET"])
 def yt_history():
+    """시청 기록 조회 (필터: video/shorts/live/all)"""
     user_id = request.args.get("user_id")
-    type_code = request.args.get("type_code", "all")
+    type_filter = request.args.get("type", "all")
+
+    if not user_id:
+        return jsonify({"success": False, "error": "user_id is required"}), 400
 
     conn = get_db()
     cur = conn.cursor(dictionary=True)
 
-    filter_sql = "" if type_code == "all" else f"AND vt.type_code = '{type_code}'"
-
-    query = f"""
-        SELECT
-            v.video_id,
+    sql = """
+        SELECT 
+            h.history_id,
+            h.video_id,
             v.title,
-            v.category,
-            vt.type_code,
-            vt.type_name,
             v.thumbnail_url,
+            v.duration,
+            v.type_id,
+            vt.type_name,
+            h.last_position,
+            h.is_finished,
             h.watched_at,
-            h.duration_watched,
-            h.device_type
+            v.view_count,
+            v.like_count,
+            v.comment_count,
+            u.user_id AS creator_id,
+            u.username AS creator_name,
+            u.handle AS creator_handle,
+            u.profile_img AS creator_profile
         FROM WatchHistory h
         JOIN Videos v ON h.video_id = v.video_id
         JOIN VideoType vt ON v.type_id = vt.type_id
+        JOIN Users u ON v.user_id = u.user_id
         WHERE h.user_id = %s
-        {filter_sql}
-        ORDER BY h.watched_at DESC;
     """
+    params = [user_id]
 
-    cur.execute(query, (user_id,))
+    if type_filter != "all":
+        sql += " AND vt.type_name = %s"
+        params.append(type_filter)
+
+    sql += " ORDER BY h.watched_at DESC"
+
+    cur.execute(sql, tuple(params))
     rows = cur.fetchall()
+
     cur.close()
     conn.close()
 
-    for r in rows:
-        if isinstance(r.get("watched_at"), (datetime.date, datetime.datetime)):
-            r["watched_at"] = str(r["watched_at"])
-        if r.get("duration_watched") is not None:
-            r["duration_watched"] = str(r["duration_watched"])
+    # datetime 변환
+    for row in rows:
+        if row.get("watched_at"):
+            row["watched_at"] = row["watched_at"].strftime('%Y-%m-%d %H:%M:%S')
 
-    return jsonify(rows)
+    return jsonify({
+        "success": True,
+        "count": len(rows),
+        "history": rows
+    })
 
 
 # ============================================================
-# 3) 재생목록 목록
-#    POST /yt_playlists
+# 3) Playlists (재생목록 목록)
+#    GET /yt_playlists/<user_id>
 # ============================================================
 @yt_bp.route("/yt_playlists/<int:user_id>", methods=["GET"])
 def yt_playlists(user_id):
-
+    """사용자의 재생목록 조회"""
     conn = get_db()
     cur = conn.cursor(dictionary=True)
 
-    query = """
+    cur.execute("""
         SELECT 
             p.playlist_id,
             p.title,
-            p.visibility,
+            p.is_public,
             p.created_at,
-            COUNT(pv.video_id) AS video_count
+            COUNT(pi.video_id) AS item_count
         FROM Playlists p
-        LEFT JOIN PlaylistVideo pv ON p.playlist_id = pv.playlist_id
+        LEFT JOIN PlaylistItems pi ON p.playlist_id = pi.playlist_id
         WHERE p.user_id = %s
-        GROUP BY p.playlist_id, p.title, p.visibility, p.created_at
-        ORDER BY p.created_at DESC;
-    """
+        GROUP BY p.playlist_id, p.title, p.is_public, p.created_at
+        ORDER BY p.created_at DESC
+    """, (user_id,))
 
-    cur.execute(query, (user_id,))
     rows = cur.fetchall()
+
     cur.close()
     conn.close()
 
-    for r in rows:
-        if isinstance(r.get("created_at"), (datetime.date, datetime.datetime)):
-            r["created_at"] = str(r["created_at"])
+    # datetime 변환
+    for row in rows:
+        if row.get("created_at"):
+            row["created_at"] = row["created_at"].strftime('%Y-%m-%d %H:%M:%S')
 
-    return jsonify(rows)
+    return jsonify({
+        "success": True,
+        "count": len(rows),
+        "playlists": rows
+    })
 
 
 # ============================================================
-# 4) 내 동영상 (video / shorts / live 구분)
-#    POST /yt_myvideos
+# 4) My Videos (업로드한 영상)
+#    GET /yt_myvideos?user_id=<user_id>&type=<all|video|shorts|live>
 # ============================================================
 @yt_bp.route("/yt_myvideos", methods=["GET"])
 def yt_myvideos():
+    """사용자가 업로드한 영상 조회"""
     user_id = request.args.get("user_id")
-    type_code = request.args.get("type_code", "all")
+    type_filter = request.args.get("type", "all")
+
+    if not user_id:
+        return jsonify({"success": False, "error": "user_id is required"}), 400
 
     conn = get_db()
     cur = conn.cursor(dictionary=True)
 
-    filter_sql = "" if type_code == "all" else "AND vt.type_code = %s"
-
-    query = f"""
+    sql = """
         SELECT
             v.video_id,
             v.title,
-            v.category,
-            vt.type_code,
-            vt.type_name,
+            v.thumbnail_url,
+            v.duration,
             v.visibility,
-            v.upload_date,
-            IFNULL(s.view_count, v.views) AS views,
-            IFNULL(s.like_count, 0) AS likes,
-            IFNULL(s.comment_count, 0) AS comments,
-            v.duration
+            vt.type_id,
+            vt.type_name,
+            v.view_count,
+            v.like_count,
+            v.comment_count,
+            v.upload_date
         FROM Videos v
         JOIN VideoType vt ON v.type_id = vt.type_id
-        LEFT JOIN VideoStats s ON v.video_id = s.video_id
         WHERE v.user_id = %s
-        {filter_sql}
-        ORDER BY v.upload_date DESC;
     """
+    params = [user_id]
 
-    params = (user_id,) if type_code == "all" else (user_id, type_code)
-    cur.execute(query, params)
+    if type_filter != "all":
+        sql += " AND vt.type_name = %s"
+        params.append(type_filter)
+
+    sql += " ORDER BY v.upload_date DESC"
+
+    cur.execute(sql, tuple(params))
     rows = cur.fetchall()
+
     cur.close()
     conn.close()
 
-    for r in rows:
-        if isinstance(r.get("upload_date"), (datetime.date, datetime.datetime)):
-            r["upload_date"] = str(r["upload_date"])
-        if r.get("duration") is not None:
-            r["duration"] = str(r["duration"])
+    # datetime 변환
+    for row in rows:
+        if row.get("upload_date"):
+            row["upload_date"] = row["upload_date"].strftime('%Y-%m-%d %H:%M:%S')
 
-    return jsonify(rows)
+    return jsonify({
+        "success": True,
+        "count": len(rows),
+        "videos": rows
+    })
 
 
 # ============================================================
-# 5) 오프라인 저장 동영상
-#    POST /yt_offline
+# 5) Offline Saved Videos (오프라인 저장 영상)
+#    GET /yt_offline/<user_id>
 # ============================================================
 @yt_bp.route("/yt_offline/<int:user_id>", methods=["GET"])
 def yt_offline(user_id):
-
+    """오프라인 저장 영상 조회"""
     conn = get_db()
     cur = conn.cursor(dictionary=True)
 
-    query = """
+    cur.execute("""
         SELECT
-            o.offline_id,
-            v.video_id,
+            o.user_id,
+            o.video_id,
             v.title,
-            vt.type_code,
-            vt.type_name,
             v.thumbnail_url,
-            o.save_date,
-            o.file_size_mb,
-            o.quality,
-            o.storage_type,
-            o.is_updated
+            v.duration,
+            vt.type_name,
+            o.file_path,
+            o.saved_at,
+            o.expired_at,
+            u.username AS creator_name,
+            u.handle AS creator_handle
         FROM OfflineVideo o
         JOIN Videos v ON o.video_id = v.video_id
         JOIN VideoType vt ON v.type_id = vt.type_id
+        JOIN Users u ON v.user_id = u.user_id
         WHERE o.user_id = %s
-        ORDER BY o.save_date DESC;
-    """
+        ORDER BY o.saved_at DESC
+    """, (user_id,))
 
-    cur.execute(query, (user_id,))
     rows = cur.fetchall()
+
     cur.close()
     conn.close()
 
-    for r in rows:
-        if isinstance(r.get("save_date"), (datetime.date, datetime.datetime)):
-            r["save_date"] = str(r["save_date"])
+    # datetime 변환
+    for row in rows:
+        if row.get("saved_at"):
+            row["saved_at"] = row["saved_at"].strftime('%Y-%m-%d %H:%M:%S')
+        if row.get("expired_at"):
+            row["expired_at"] = row["expired_at"].strftime('%Y-%m-%d %H:%M:%S')
 
-    return jsonify(rows)
+    return jsonify({
+        "success": True,
+        "count": len(rows),
+        "offline_videos": rows
+    })
 
 
 # ============================================================
-# 6) 영화 구매/대여 목록
-#    POST /yt_movies
+# 6) Movie Purchases (영화 구매/대여 내역)
+#    GET /yt_movies/<user_id>
 # ============================================================
 @yt_bp.route("/yt_movies/<int:user_id>", methods=["GET"])
 def yt_movies(user_id):
-
+    """영화 구매/대여 내역 조회"""
     conn = get_db()
     cur = conn.cursor(dictionary=True)
 
-    query = """
-        SELECT
-            m.movie_id,
+    cur.execute("""
+        SELECT 
+            mp.purchase_id,
+            mp.movie_id,
             m.title,
-            m.genre,
-            m.release_year,
-            m.duration,
-            m.rating_label,
             m.thumbnail_url,
-            mp.purchase_type,
-            mp.purchase_date,
-            mp.expire_date,
-            mp.price
-        FROM MoviePurchase mp
-        JOIN Movie m ON mp.movie_id = m.movie_id
+            m.duration,
+            m.release_year,
+            mp.type,
+            mp.price_paid,
+            mp.expired_at,
+            mp.created_at
+        FROM MoviePurchases mp
+        JOIN Movies m ON mp.movie_id = m.movie_id
         WHERE mp.user_id = %s
-        ORDER BY mp.purchase_date DESC;
-    """
+        ORDER BY mp.created_at DESC
+    """, (user_id,))
 
-    cur.execute(query, (user_id,))
     rows = cur.fetchall()
+
     cur.close()
     conn.close()
 
-    for r in rows:
-        if isinstance(r.get("purchase_date"), (datetime.date, datetime.datetime)):
-            r["purchase_date"] = str(r["purchase_date"])
-        if r.get("expire_date") is not None and isinstance(
-            r.get("expire_date"), (datetime.date, datetime.datetime)
-        ):
-            r["expire_date"] = str(r["expire_date"])
-        if r.get("duration") is not None:
-            r["duration"] = str(r["duration"])
+    # datetime 및 decimal 변환
+    for row in rows:
+        if row.get("created_at"):
+            row["created_at"] = row["created_at"].strftime('%Y-%m-%d %H:%M:%S')
+        if row.get("expired_at"):
+            row["expired_at"] = row["expired_at"].strftime('%Y-%m-%d %H:%M:%S')
+        if row.get("price_paid"):
+            row["price_paid"] = float(row["price_paid"])
 
-    return jsonify(rows)
+    return jsonify({
+        "success": True,
+        "count": len(rows),
+        "purchases": rows
+    })
 
 
 # ============================================================
-# 7) Premium 정보 + 사용량
-#    POST /yt_premium
+# 7) Premium Info (프리미엄 정보)
+#    GET /yt_premium/<user_id>
 # ============================================================
 @yt_bp.route("/yt_premium/<int:user_id>", methods=["GET"])
 def yt_premium(user_id):
-
+    """프리미엄 멤버십 정보 조회"""
     conn = get_db()
     cur = conn.cursor(dictionary=True)
 
-    # Premium 가입 정보
-    cur.execute(
-        """
-        SELECT premium_id, join_date, plan_type, is_active
+    cur.execute("""
+        SELECT 
+            user_id,
+            plan_type, 
+            start_date, 
+            end_date
         FROM Premium
-        WHERE user_id = %s;
-        """,
-        (user_id,),
-    )
-    info = cur.fetchall()
+        WHERE user_id = %s
+    """, (user_id,))
 
-    # Premium 사용 내역
-    cur.execute(
-        """
-        SELECT pu.benefit_type, pu.usage_value, pu.last_updated
-        FROM PremiumUsage pu
-        WHERE pu.premium_id IN (
-            SELECT premium_id FROM Premium WHERE user_id = %s
-        );
-        """,
-        (user_id,),
-    )
-    usage = cur.fetchall()
-
-    cur.close()
-    conn.close()
-
-    for p in info:
-        if isinstance(p.get("join_date"), (datetime.date, datetime.datetime)):
-            p["join_date"] = str(p["join_date"])
-
-    for u in usage:
-        if isinstance(u.get("last_updated"), (datetime.date, datetime.datetime)):
-            u["last_updated"] = str(u["last_updated"])
-
-    return jsonify({"premium": info, "usage": usage})
-
-
-# ============================================================
-# 8) 시청 시간
-#    POST /yt_watchtime
-# ============================================================
-@yt_bp.route("/yt_watchtime/<int:user_id>", methods=["GET"])
-def yt_watchtime(user_id):
-
-    conn = get_db()
-    cur = conn.cursor(dictionary=True)
-
-    cur.execute(
-        """
-        SELECT avg_daily_minutes, total_week_minutes,
-               compare_last_week, updated_at
-        FROM WatchTime
-        WHERE user_id = %s;
-        """,
-        (user_id,),
-    )
     row = cur.fetchone()
 
     cur.close()
     conn.close()
 
-    if row:
-        if isinstance(row.get("updated_at"), (datetime.date, datetime.datetime)):
-            row["updated_at"] = str(row["updated_at"])
+    if not row:
+        return jsonify({
+            "success": False,
+            "message": "No premium subscription found"
+        })
 
-    return jsonify(row)
+    # is_active를 Python에서 계산 (end_date > 현재 시간)
+    if row.get("end_date"):
+        is_active = row["end_date"] > datetime.now()
+        row["is_active"] = is_active
+    else:
+        row["is_active"] = False
+
+    # datetime 변환
+    if row.get("start_date"):
+        row["start_date"] = row["start_date"].strftime('%Y-%m-%d %H:%M:%S')
+    if row.get("end_date"):
+        row["end_date"] = row["end_date"].strftime('%Y-%m-%d %H:%M:%S')
+
+    return jsonify({
+        "success": True,
+        "premium": row
+    })
 
 
 # ============================================================
-# 9) 고객센터(내 문의)
-#    POST /yt_support
+# 8) Watch Time Statistics (시청 시간 통계)
+#    GET /yt_watchtime/<user_id>
 # ============================================================
-@yt_bp.route("/yt_support/<int:user_id>", methods=["GET"])
-def yt_support(user_id):
-
+@yt_bp.route("/yt_watchtime/<int:user_id>", methods=["GET"])
+def yt_watchtime(user_id):
+    """시청 시간 통계 조회"""
     conn = get_db()
     cur = conn.cursor(dictionary=True)
 
-    cur.execute(
-        """
-        SELECT support_id, category, message, status, created_at
-        FROM Support
+    cur.execute("""
+        SELECT 
+            watchtime_id,
+            user_id,
+            avg_daily_minutes,
+            total_week_minutes,
+            compare_last_week,
+            updated_at
+        FROM WatchTime
         WHERE user_id = %s
-        ORDER BY created_at DESC;
-        """,
-        (user_id,),
-    )
+    """, (user_id,))
+
+    row = cur.fetchone()
+
+    cur.close()
+    conn.close()
+
+    if not row:
+        return jsonify({
+            "success": False,
+            "message": "No watch time statistics found"
+        })
+
+    # datetime 변환
+    if row.get("updated_at"):
+        row["updated_at"] = row["updated_at"].strftime('%Y-%m-%d %H:%M:%S')
+
+    return jsonify({
+        "success": True,
+        "watchtime": row
+    })
+
+
+# ============================================================
+# 9) Support Tickets (고객센터 문의 내역)
+#    GET /yt_support/<user_id>
+# ============================================================
+@yt_bp.route("/yt_support/<int:user_id>", methods=["GET"])
+def yt_support(user_id):
+    """고객센터 문의 내역 조회"""
+    conn = get_db()
+    cur = conn.cursor(dictionary=True)
+
+    cur.execute("""
+        SELECT 
+            ticket_id,
+            user_id,
+            type,
+            subject,
+            message,
+            status,
+            created_at
+        FROM SupportTickets
+        WHERE user_id = %s
+        ORDER BY created_at DESC
+    """, (user_id,))
+
     rows = cur.fetchall()
 
     cur.close()
     conn.close()
 
-    for r in rows:
-        if isinstance(r.get("created_at"), (datetime.date, datetime.datetime)):
-            r["created_at"] = str(r["created_at"])
+    # datetime 변환
+    for row in rows:
+        if row.get("created_at"):
+            row["created_at"] = row["created_at"].strftime('%Y-%m-%d %H:%M:%S')
 
-    return jsonify(rows)
+    return jsonify({
+        "success": True,
+        "count": len(rows),
+        "tickets": rows
+    })
